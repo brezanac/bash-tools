@@ -1,0 +1,294 @@
+#!/usr/bin/env bash
+####################################################################################################
+# A highly customizable and feature rich bash script for performing backups of files and folders.
+####################################################################################################
+# - Support for two backup methods: syncing (requires rsync) and archiving (requires tar).
+# - Archived backups that can produce both compressed (gzip) and uncompressed output.
+# - Support for preserving only a specified number of recent backups ($nr_backups_kept).
+# - Specifying source paths directly ($source_direct_paths) or as a list of paths whose immediate 
+#   children ($source_parent_paths) will be backed up.
+# - Excluding specific paths from the backup ($excluded_paths).
+# - Notification emails on failed backups etc.
+# - Detailed output for all operations.
+####################################################################################################
+
+# Loading the external configuration file.
+if ! source ./.config >/dev/null 2>&1; then
+    printf '%b[ABORTING] External configuration not found!%b\n' "${col[red]}" "${col[def]}"
+    exit 1
+fi
+
+# $backup_path must be set.
+if [[ -z "$backup_path" ]]; then
+    printf '%b[ABORTING] Missing value for backup_path!%b\n' "${col[red]}" "${col[def]}"
+    exit 1
+fi
+
+# Either $source_direct_paths or $source_parent_paths must have set values.
+if [[ "${#source_direct_paths[@]}" -eq 0 ]] && [[ "${#source_parent_paths[@]}" -eq 0 ]]; then
+    printf '%b[ABORTING] Missing values for both source_direct_paths and source_parent_paths!%b\n' \
+        "${col[red]}" "${col[def]}"
+    exit 1
+fi
+
+####################################################################################################
+# Sorts items for the given path by creation time (oldest first).
+####################################################################################################
+#     Usage: sort_by_creation [path]
+#   Options:
+#         path - path to sort (optional), if omitted '.' will be used. 
+####################################################################################################
+sort_by_ctime(){
+    LC_ALL=C find "${1:-.}" -maxdepth 1 -mindepth 1 -printf '%T@ %TY-%Tm-%Td %TX %p\0' \
+    | sort -zn \
+    | while read -rd '' _ _ _ path;
+    do 
+        printf '%s\n' "$path";
+    done
+}
+
+####################################################################################################
+# Calculates duration between two timestamps with decimal precision.
+####################################################################################################
+#     Usage: duration timestamp_1 timestamp_2
+#   Options:
+#       timestamp_1, timestamp_2 - timestamps between which to calculate duration.
+####################################################################################################
+duration(){
+    if [[ -z "$1" ]]; then
+        printf 'Required parameter timestamp_1 for function %s() is missing!' "${FUNCNAME[0]}"
+        return 1
+    fi
+
+    if [[ -z "$2" ]]; then
+        printf 'Required parameter timestamp_2 for function %s() is missing!' "${FUNCNAME[0]}"
+        return 1
+    fi
+
+    # Function correctly identifies timestamp order.
+    values="$1 $2"
+    if (( $(echo "$values" | awk '{ print ($1 < $2)}')  )); then 
+        values="$2 $1"      
+    fi
+    echo "$values" | awk '{ printf "%.3f", $1-$2 }'
+}
+
+####################################################################################################
+# Returns a randomly generated string in the following format '[A-Za-z0-9]{$length}'.
+####################################################################################################
+#     Usage: random length
+#   Options:
+#       length - length of the generated random string (required).
+####################################################################################################
+random(){
+    if [[ -z "$1" ]]; then
+        printf 'Required parameter length for function %s() is missing!' "${FUNCNAME[0]}"
+        return 1
+    fi
+
+    printf '%s' "$(head /dev/urandom | tr -dc A-Za-z0-9 | head -c "$1")"
+}
+
+####################################################################################################
+# Makes sure only a specified number of latest backups ($nr_backups_kept) is kept.
+####################################################################################################
+#     Usage: cleanup_backup path pattern
+#   Options:
+#         path - path containing backups to clean up (required).
+#      pattern - regex pattern for valid backup names (required).
+####################################################################################################
+cleanup_backup(){
+    if [[ -z "$1" ]]; then
+        printf 'Required parameter path for function %s() is missing!' "${FUNCNAME[0]}"
+        return 1
+    fi
+
+    if [[ -z "$2" ]]; then
+        printf 'Required parameter pattern for function %s() is missing!' "${FUNCNAME[0]}"
+        return 1
+    fi
+
+    nr_backups="$(find "$1" -maxdepth 1 -mindepth 1 | wc -l)"
+    # Skipping cleanup if it's disabled or number of backups is less than $nr_backups_kept.
+    if [[ "$nr_backups_kept" == false ]] || [[ "$nr_backups" -le "$nr_backups_kept" ]];then
+        return 1
+    fi
+    
+    nr_backups_to_remove=$((nr_backups-nr_backups_kept))
+    mapfile -t backups < <(sort_by_ctime "$1" | head -n "$nr_backups_to_remove")
+
+    for backup in "${backups[@]}"; do
+        # Target name needs to match a predefined pattern before removal otherwise it's skipped.
+        if [[ ! "$backup" =~ $2 ]]; then
+            printf '[WARNING] %s failed to pass the name pattern check...%b[SKIPPING]%b\n' \
+            "$backup" "${col[red]}" "${col[def]}"
+            continue
+        fi
+        
+        if rm -R "$backup"; then
+            printf '[CLEANING] %s...%b[REMOVED]%b\n' "$backup" "${col[yellow]}" "${col[def]}"
+        fi
+    done
+}
+
+# Making sure all the tool dependencies are available on the system.
+if [[ "$backup_method" == "sync" ]] && ! command -v rsync >/dev/null 2>&1; then
+    printf '%b[ABORTING] rsync not found!%b\n' "${col[red]}" "${col[def]}"
+    exit 1
+fi
+
+if  [[ "$backup_method" == "archive" ]] && ! command -v tar >/dev/null 2>&1; then
+    printf '%b[ABORTING] tar not found!%b\n' "${col[red]}" "${col[def]}"
+    exit 1
+fi
+
+# "Buckle your seatbelt Dorothy, 'cause Kansas is going bye-bye!"
+t_script_start=$(date "+%s.%N")
+printf '%b[BACKUP STARTED] %s%b\n' "${col[yellow]}" "$(date "$date_format")" "${col[def]}"
+
+# Making sure the backup path is available.
+mkdir -p "$backup_path" || { printf '%b[ABORTING] Failed to create backup_path!%b\n' "${col[red]}" \
+    "${col[def]}"; exit 1; }
+
+# List of all the paths that will get backed up, direct paths and parent's children paths combined.
+source_paths=()
+
+# Adding direct paths to the list of paths to back up.
+for path in "${source_direct_paths[@]}"; do
+    # Make sure the current path exists.
+    if [[ ! -d "$path" ]]; then
+        printf '[WARNING] Direct path %s...%b[MISSING]!%b\n' "$path" "${col[red]}" "${col[def]}"
+        continue
+    fi
+    source_paths+=("$path")
+done
+
+# Adding parent paths immediate children to the list of paths to back up.
+for path in "${source_parent_paths[@]}"; do
+    # Make sure the current path exists.
+    if [[ ! -d "$path" ]]; then
+        printf '[WARNING] Parent path %s...%b[MISSING]!%b\n' "$path" "${col[red]}" "${col[def]}"
+        continue
+    fi
+
+    # '-maxdepth 1 -mindepth 1' makes sure only children paths, without the parent path are used.
+    mapfile -t parent_paths< <(find "$path" -maxdepth 1 -mindepth 1 -type d)
+    for parent_path in "${parent_paths[@]}"; do
+        source_paths+=("$parent_path")
+    done
+done
+
+# Excluding paths from $source_paths if they are directly listed in $excluded_paths.
+for path in "${!source_paths[@]}"; do
+    for path_excl in "${excluded_paths[@]}"; do
+        if [[ "${source_paths[path]}" == "$path_excl" ]]; then
+            printf '[EXCLUDING] %s (%b%s%b)\n' "${source_paths[path]}" "${col[yellow]}" \
+                "$path_excl" "${col[def]}"
+            unset "source_paths[path]"
+        fi
+    done
+done
+
+# Removing duplicate source paths.
+unique_paths=()
+for path in "${source_paths[@]}"; do
+    for unique in "${unique_paths[@]}"; do
+        if [[ "$path" == "$unique" ]]; then 
+            continue 2
+        fi
+    done
+    unique_paths+=("$path")
+done
+source_paths=("${unique_paths[@]}")
+
+# Making sure there is enough space to backup all the source paths.
+required_bytes=0
+available_bytes=$(df -hB1 "$backup_path" --output=avail | sed 1d)
+for path in "${source_paths[@]}"; do
+    ((required_bytes+="$(du -shB1 "$path" | cut -f 1)"))
+done
+
+if [[ "$required_bytes" -ge "$available_bytes" ]]; then
+    printf '%b[ABORTED] Not enough space: %s bytes required, only %s bytes available!%b\n' \
+    "${col[red]}" "$required_bytes" "$available_bytes" "${col[def]}"
+    
+    # Notification emails are turned on but mail is not available.
+    if [[ "$send_email_notifications" != false ]] && ! command -v mail >/dev/null 2>&1; then
+        printf '%b[WARNING] mail not found!%b\n' "${col[yellow]}" "${col[def]}"
+        exit 1
+    fi
+    
+    if [[ "$send_email_notifications" != false ]]; then
+        printf -v email[subject] '[BACKUP FAILURE] %s (%s)' "$(hostname)" "$(date "$date_format")"
+        printf -v email[body] 'Not enough space: required %s bytes, available %s bytes.' \
+            "${required_bytes}" "${available_bytes}"
+        
+        # Sending the notification email.
+        echo "${email[body]}" | mail -a "From: ${email[from]}" -a "Reply-To: ${email[reply_to]}" \
+                -s "${email[subject]}" "${email[to]}"
+        printf '%b[NOTICE] Notification email sent to "%s"%b.' "${col[yellow]}" \
+        "${email[to]}" "${col[def]}"
+    fi
+    exit 1
+fi
+
+# Generating exclusion parameters for rsync and tar (both use the same --exclude syntax).
+excluded=()
+for exclude in "${excluded_paths[@]}"; do
+    excluded+=("--exclude=$exclude")
+done
+
+# Doing the actual backup.
+for source in "${source_paths[@]}"; do
+    backup_target="${backup_path}/${source//\//_}"
+    
+    # Making sure the destination sub-folder exists.
+    mkdir -p "$backup_target" || { printf '%b[ABORTING] Failed to create backup folder!%b\n' "${col[red]}" \
+    "${col[def]}"; exit 1; }
+
+    # Random string used to make sure backup names are truly random.
+    # Also prevents overwrites in case more than one backup is made per second.
+    rnd_token=$(random "$rnd_token_length")
+
+    if [[ "$backup_method" == "sync" ]]; then
+        printf '[BACKING UP] %s...' "$source"
+        t_start=$(date "+%s.%N")
+        # rsync is going to execute no matter what exit status it returns!
+        if ! rsync "${excluded[@]}" \
+            -aR "$source" \
+            "${backup_target}/${source//\//_}-$(date +%Y%m%d-%H%M%S)-${rnd_token}_backup";
+        then
+            printf '%b[FAILED]!%b\n' "${col[red]}" "${col[def]}"
+            continue
+        fi
+        t_end=$(date "+%s.%N")
+        printf '%b[DONE]%b (%ss)\n' "${col[green]}" "${col[def]}" "$(duration "$t_end" "$t_start")"
+        # Cleaning up backups.
+        cleanup_backup "$backup_target" "-[A-Za-z0-9]{${rnd_token_length}}_backup(\\.tar||\\.tar.gz)$"
+        continue
+    fi 
+    
+    printf '[ARCHIVING] %s...' "$source"
+    if [[ "$compress_archives" == true ]]; then
+        tar_opt="cfz"
+    fi
+
+    t_start=$(date "+%s.%N")
+    # NOTICE: it's important to prevent the script from breaking if tar returns the notorious exit 
+    # code 1 which indicates that a file has been modified or deleted during command execution.
+    if ! tar ${tar_opt:-cf} \
+        "${backup_target}/${source//\//_}-$(date +%Y%m%d-%H%M%S)-${rnd_token}_backup.tar${tar_opt:+.gz}" \
+        "${excluded[@]/--exclude=\//--exclude=}" -C / "${source#/}" && [[ "$?" -ne 1 ]];then
+        printf '%b[FAILED]!%b\n' "${col[red]}" "${col[def]}"
+        continue
+    fi
+    t_end=$(date "+%s.%N") # 'tar' end timestamp
+    printf '%b[DONE]%b (%ss)\n' "${col[green]}" "${col[def]}" "$(duration "$t_end" "$t_start")"
+    # Cleaning up backups.
+    cleanup_backup "$backup_target" "-[A-Za-z0-9]{${rnd_token_length}}_backup(\\.tar||\\.tar.gz)$"
+done
+
+# Printing out final notes and script execution duration.
+t_script_end=$(date "+%s.%N")
+printf '%b[BACKUP COMPLETE] %s (total execution time %ss)%b\n' "${col[yellow]}" "$(date "$date_format")" \
+"$(duration "$t_script_end" "$t_script_start")" "${col[def]}"

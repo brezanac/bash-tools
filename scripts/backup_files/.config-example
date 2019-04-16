@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+####################################################################################################
+# Configuration for the backup_files script.
+####################################################################################################
+
+# Backup destination path.
+backup_path=''
+
+# List of direct paths to backup.
+source_direct_paths=(
+    # Example:
+    # '/srv/htdocs/www.website-alpha.com'
+    # '/srv/htdocs/www.website-beta.com'
+    # '/srv/htdocs/www.website-delta.com'
+)
+
+# List of parent paths to backup.
+source_parent_paths=(
+    # Example:
+    # '/srv/htdocs'
+)
+
+# List of paths to exclude during backup.
+excluded_paths=(
+    # Example:
+    # '.git'
+    # 'node_modules'
+    # '/srv/htdocs/www.website-delta.com'
+)
+
+# Maximum number of backups to preserve. Use false for infinite.
+nr_backups_kept=5
+
+# Backup method. Possible values are 'sync' and 'archive'.
+backup_method='archive'
+
+# Use compression (gzip) for archives. Works only if $backup_method is set to 'archive'.
+compress_archives=true
+
+# Length of the random token.
+rnd_token_length=8
+
+# Email notifications sending.
+send_email_notifications=true
+
+# Configuration for email notifications.
+declare -A email=(
+    [from]=''
+    [to]=''
+    [reply_to]=''
+)
+
+# General date and time format used in various places.
+date_format='+%d.%m.%Y %H:%M:%S'
+
+# Output formatting ASCII codes (colors).
+declare -A col=(
+    [def]="$(tput sgr0)"
+    [red]="$(tput setaf 1)"
+    [green]="$(tput setaf 2)"
+    [yellow]="$(tput setaf 3)"
+)
