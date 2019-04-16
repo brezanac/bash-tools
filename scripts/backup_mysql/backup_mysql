@@ -1,0 +1,311 @@
+#!/usr/bin/env bash
+####################################################################################################
+# A highly customizable and feature rich bash script for performing backups of MySQL databases and 
+# user privileges (grant tables).
+####################################################################################################
+# - Support for both compressed (.sql.gz) and uncompressed (.sql) output.
+# - Support for an external options file ($mysql_cnf) and command line parameters.
+# - Full support for MySQL 5+ servers, including MySQL 5.7+ specific syntax.
+# - Support for preserving only a specified number of recent backups ($nr_backups_kept).
+# - Option to directly specify the list of databases to backup ($backup_dbs) or query the list of 
+#   available databases from the MySQL server.
+# - Exclusion of specific databases from the backup ($excluded_dbs).
+# - Support for exporting user privileges (grant tables).
+# - Exclusion of specific users from exporting their user privileges ($excluded_users).
+####################################################################################################
+
+# Loading the external configuration file.
+if ! source ./.config >/dev/null 2>&1; then
+    printf '%b[ABORTING] External configuration not found!%b\n' "${col[red]}" "${col[def]}"
+    exit 1
+fi
+
+# $backup_path must be set.
+if [[ -z "$backup_path" ]]; then
+    printf '%b[ABORTING] Missing value for backup_path!%b\n' "${col[red]}" "${col[def]}"
+    exit 1
+fi
+
+# Either $mysql_cnf or $conn must have set values.
+if [[ -z "$mysql_cnf" ]] && [[ "${#conn[@]}" -eq 0 ]]; then
+    printf '%b[ABORTING] Missing values for both mysql_cnf and conn!%b\n' \
+        "${col[red]}" "${col[def]}"
+    exit 1
+fi
+
+####################################################################################################
+# Sorts items for the given path by creation time (oldest first).
+####################################################################################################
+#     Usage: sort_by_creation [path]
+#   Options:
+#         path - path to sort (optional), if omitted '.' will be used. 
+####################################################################################################
+sort_by_ctime(){
+    LC_ALL=C find "${1:-.}" -maxdepth 1 -mindepth 1 -printf '%T@ %TY-%Tm-%Td %TX %p\0' \
+    | sort -zn \
+    | while read -rd '' _ _ _ path;
+    do 
+        printf '%s\n' "$path";
+    done
+}
+
+####################################################################################################
+# Calculates duration between two timestamps with decimal precision.
+####################################################################################################
+#     Usage: duration timestamp_1 timestamp_2
+#   Options:
+#       timestamp_1, timestamp_2 - timestamps between which to calculate duration.
+####################################################################################################
+duration(){
+    if [[ -z "$1" ]]; then
+        printf 'Required parameter timestamp_1 for function %s() is missing!' "${FUNCNAME[0]}"
+        return 1
+    fi
+
+    if [[ -z "$2" ]]; then
+        printf 'Required parameter timestamp_2 for function %s() is missing!' "${FUNCNAME[0]}"
+        return 1
+    fi
+
+    # Function takes care to identify the higher timestamp value.
+    values="$1 $2"
+    if (( $(echo "$values" | awk '{ print ($1 < $2)}')  )); then 
+        values="$2 $1"      
+    fi
+    echo "$values" | awk '{ printf "%.3f", $1-$2 }'
+}
+
+####################################################################################################
+# Returns a randomly generated string in the following format '[A-Za-z0-9]{$length}'.
+####################################################################################################
+#     Usage: random length
+#   Options:
+#       length - length of the generated random string (required).
+####################################################################################################
+random(){
+    if [[ -z "$1" ]]; then
+        printf 'Required parameter length for function %s() is missing!' "${FUNCNAME[0]}"
+        return 1
+    fi
+
+    printf '%s' "$(head /dev/urandom | tr -dc A-Za-z0-9 | head -c "$1")"
+}
+
+####################################################################################################
+# Makes sure only a specified number of latest backups ($nr_backups_kept) is kept.
+####################################################################################################
+#     Usage: cleanup_backup path pattern
+#   Options:
+#         path - path containing backups to clean up (required).
+#      pattern - regex pattern for valid backup names (required).
+####################################################################################################
+cleanup_backup(){
+    if [[ -z "$1" ]]; then
+        printf 'Required parameter path for function %s() is missing!' "${FUNCNAME[0]}"
+        return 1
+    fi
+
+    if [[ -z "$2" ]]; then
+        printf 'Required parameter pattern for function %s() is missing!' "${FUNCNAME[0]}"        
+        return 1
+    fi
+
+    nr_backups="$(find "$1" -maxdepth 1 -mindepth 1 | wc -l)"
+    # Skipping cleanup if it's disabled or number of backups is less than $nr_backups_kept.
+    if [[ "$nr_backups_kept" == false ]] || [[ "$nr_backups" -le "$nr_backups_kept" ]];then
+        return 1
+    fi
+    
+    nr_backups_to_remove=$((nr_backups-nr_backups_kept))
+    mapfile -t backups < <(sort_by_ctime "$1" | head -n "$nr_backups_to_remove")
+
+    for backup in "${backups[@]}"; do
+        # Target name needs to match a predefined pattern before removal otherwise it's skipped.
+        if [[ ! "$backup" =~ $2 ]]; then
+            printf '[WARNING] %s failed to pass the name pattern check...%b[SKIPPING]%b\n' \
+            "$backup" "${col[red]}" "${col[def]}"
+            continue
+        fi
+        
+        if rm -R "$backup"; then
+            printf '[CLEANING] %s...%b[REMOVED]%b\n' "$backup" "${col[yellow]}" "${col[def]}"
+        fi
+    done
+}
+
+####################################################################################################
+# Exports MySQL user privileges.
+####################################################################################################
+#     Usage: export_grants 
+#   Options:
+#         none
+####################################################################################################
+export_grants()
+{
+    # MySQL server version.
+    mysql_version=$(mysql --version | awk '{print $5}' | awk -F, '{print $1}')
+
+    # List of available MySQL users (depends on the privileges of the MySQL user making the query).
+    mapfile -t mysql_users < <(mysql_options mysql -B -N -e \
+        "SELECT DISTINCT CONCAT('\\'',user,'\\'@\\'',host,'\\'') FROM mysql.user")
+
+    # Exporting user privileges for all available users.
+    for user in "${mysql_users[@]}"; do
+        # Making sure to skip excluded MySQL users.
+        for excl_user in "${excluded_users[@]}"; do
+            if [[ "$excl_user" == "$user" ]]; then
+                # Sending output to stderr in order to separate it from function output (stdout).
+                printf '[WARNING] User %s...%b[EXCLUDED]%b\n' "$user" "${col[yellow]}" \
+                "${col[def]}" >&2
+                continue 2
+            fi
+        done
+
+        # MySQL 5.7 requires IDENTIFIED BY to be provided with CREATE USER instead of SHOW GRANTS.
+        if [[ "$mysql_version" =~ ^5\.7\. ]]; then
+            printf '%s\n%s\n\n' "## Create user ${user} ##" \
+                "$(mysql_options mysql -B -N -e "SHOW CREATE USER $user")"
+        fi
+        # The actual export is same for all versions.
+        printf '%s\n%s\n\n' "## Grants for user ${user} ##" \
+                "$(mysql_options mysql -B -N -e "SHOW GRANTS FOR $user")"
+    done
+}
+
+# Making sure all the tool dependencies are available on the system.
+if ! command -v mysql >/dev/null 2>&1; then
+    printf '%b[ABORTING] mysql not found!%b\n' "${col[red]}" "${col[def]}"
+    exit 1
+fi
+
+if ! command -v mysqldump >/dev/null 2>&1; then
+    printf '%b[ABORTING] mysqldump not found!%b\n' "${col[red]}" "${col[def]}"
+    exit 1
+fi
+
+if ! command -v mysqlshow >/dev/null 2>&1; then
+    printf '%b[ABORTING] mysqlshow not found!%b\n' "${col[red]}" "${col[def]}"
+    exit 1
+fi
+
+# "Buckle your seatbelt Dorothy, 'cause Kansas is going bye-bye!"
+t_script_start=$(date "+%s.%N")
+printf '%b[BACKUP STARTED] %s%b\n' "${col[yellow]}" "$(date "$date_format")" "${col[def]}"
+
+# Default is to use an external options file.
+mysql_options() { "${@:1:1}" --defaults-extra-file="$mysql_cnf" --defaults-group-suffix="$db" \
+    "${@:2}"; }
+
+# In case no options file is provided, command line parameters are used instead.
+if [[ -z "$mysql_cnf" ]]; then
+    # 2>/dev/null is added to prevent stderr messages about using credentials on the command line
+    mysql_options() { "$@" -h "${conn[host]}" -u "${conn[user]}" -p"${conn[password]}" 2>/dev/null; }
+fi
+
+# In case $backup_dbs is not set we will query the MySQL server for a list of available databases.
+if [[ "${#backup_dbs[@]}" -eq 0 ]]; then
+    mapfile -t backup_dbs < <(mysql_options mysqlshow \
+        | tr -d '| ' \
+        | grep -v 'Databases' \
+        | grep -v '^+\-*+$'
+    )
+fi
+
+# Making sure that the destination backup path is available.
+if [[ ! -d "$backup_path" ]]; then
+    printf '[NOTICE] Creating backup target folder...'
+    mkdir -p "$backup_path" >/dev/null 2>&1 && \
+        printf '%b[DONE]%b\n' "${col[green]}" "${col[def]}" || \
+        printf '%b[FAILED]%b\n' "${col[red]}" "${col[def]}"
+fi
+
+for db in "${backup_dbs[@]}"; do
+    # Checking if the current database should be excluded from the backup.
+    for excl_db in "${excluded_dbs[@]}"; do
+        if [[ "$db" == "$excl_db" ]]; then
+            printf '[WARNING] Database %s...%b[EXCLUDED]%b\n' "$db" "${col[yellow]}" "${col[def]}"
+            continue 2
+        fi
+    done
+
+    # Making sure that the current database exists.
+    db_exists="$(mysql_options mysqlshow \
+        | tr -d '| ' \
+        | grep -v 'Databases' \
+        | grep -v '^+\-*+$' \
+        | grep "$db")"
+
+    if [[ -z "$db_exists" ]]; then
+        printf '[ERROR] Database %s...%b[MISSING]%b\n' "${col[red]}" "$db" "${col[def]}"
+        continue
+    fi
+
+    # Making sure that the destination backup path sub-folder exists.
+    if [[ ! -d "${backup_path}/${db}" ]]; then
+        printf '[NOTICE] Creating new folder for %s...' "$db"
+        if ! mkdir -p "${backup_path}/${db}" >/dev/null 2>&1; then
+            printf '%b[FAILED]%b\n' "${col[red]}" "${col[def]}"
+            printf '%b[ERROR] Skipping %s due to failure to create backup folder.%b\n' \
+            "${col[red]}" "$db" "${col[def]}"
+            continue 
+        fi
+        printf '%b[DONE]%b\n' "${col[green]}" "${col[def]}"
+    fi
+
+    # Random string used to make sure backup names are truly random.
+    # Also prevents overwrites in case more than one backup is made per second.
+    rnd_token=$(random "$rnd_token_length")
+
+    # Performing the actual backup.
+    printf '[BACKING UP] %s...' "$db"
+    t_start=$(date "+%s.%N")
+    if [[ "$compress_backup" == true ]]; then
+        mysql_options mysqldump --databases "$db" |
+        gzip > "${backup_path}/${db}/${db}-$(date +%Y%m%d-%H%M%S)-${rnd_token}_backup.sql.gz"
+    else
+        mysql_options mysqldump --databases "$db" \
+            > "${backup_path}/${db}/${db}-$(date +%Y%m%d-%H%M%S)-${rnd_token}_backup.sql"
+    fi
+    # Checking the exit code of the last executed command ($?).
+    if [[ ! $? ]]; then
+        printf '%b[FAILED]%b\n' "${col[red]}" "${col[def]}"
+        continue
+    fi
+    t_end=$(date "+%s.%N")
+    printf '%b[DONE]%b (%ss)\n' "${col[green]}" "${col[def]}" "$(duration "$t_end" "$t_start")"
+    
+    # Cleaning up backups.
+    cleanup_backup "${backup_path}/${db}" "-[A-Za-z0-9]{${rnd_token_length}}_backup(\\.sql|\\.sql\\.gz)$"
+done
+
+# Exporting user privileges (grant tables).
+if [[ "$export_grants" == true ]]; then
+    echo '[NOTICE] Exporting user privileges (grant tables).'
+    # Making sure that the user privileges backup destination path is available.
+    if [[ ! -d "$grants_path" ]]; then 
+        printf '[NOTICE] Creating new backup folder for grant tables...'
+        mkdir -p "$grants_path" >/dev/null 2>&1 && printf '%b[DONE]%b\n' "${col[green]}" "${col[def]}" \
+        || printf '%b[FAILED]%b\n' "${col[red]}" "${col[def]}"
+    fi
+
+    if [[ -d "$grants_path" ]]; then
+        t_grants_start=$(date "+%s.%N")
+        if [[ "$compress_backup" == true ]]; then
+            export_grants | gzip > "${grants_path}/grants-$(date +%Y%m%d-%H%M%S).sql.gz"
+        else
+            export_grants > "${grants_path}/grants-$(date +%Y%m%d-%H%M%S).sql"
+        fi
+
+        t_grants_end=$(date "+%s.%N")
+        printf '[BACKING UP] user privileges (grant tables)...%b[DONE]%b (%ss)\n' "${col[green]}" \
+            "${col[def]}" "$(duration "$t_grants_end" "$t_grants_start")"
+    else
+        printf '%b[ERROR] Unable to access grants backup folder. Skipping grant tables export.%b\n' \
+        "${col[red]}" "${col[def]}"  
+    fi
+fi
+
+# Printing out final notes and script execution duration.
+t_script_end=$(date "+%s.%N")
+printf '%b[BACKUP COMPLETE] %s (total execution time %ss)%b\n' "${col[yellow]}" "$(date "$date_format")" \
+"$(duration "$t_script_end" "$t_script_start")" "${col[def]}"

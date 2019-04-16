@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+####################################################################################################
+# Configuration for the backup_mysql script.
+####################################################################################################
+
+# Backup destination path.
+backup_path=''
+
+# Path to the external MySQL options file, in case one is used.
+mysql_cnf=''
+
+# MySQL server connection parameters, if specified manually.
+declare -A conn=(
+    [host]=''
+    [user]=''
+    [password]=''
+)
+
+# Direct list of databases to back up.
+backup_dbs=(
+    # Example:
+    # 'database_alpha'
+    # 'database_beta'
+    # 'database_delta'
+)
+
+# List of databases to exclude from backup.
+excluded_dbs=(
+    # Example:
+    # 'information_schema'
+    # 'mysql'
+    # 'performance_schema'
+)
+
+# Maximum number of backups per database to preserve. Use false for infinite.
+nr_backups_kept=5
+
+# Use compression (gzip) for output.
+compress_backup=true
+
+# Export user privileges (grant tables).
+export_grants=false
+
+# List of MySQL users which will be excluded from the user privileges export.
+excluded_users=(
+    # Example:
+    # "'root'@'forge'"
+)
+
+# User privileges backup destination path.
+grants_path=''
+
+# Length of the random token.
+rnd_token_length=8
+
+# General date and time format used in various places.
+date_format='+%d.%m.%Y %H:%M:%S'
+
+# Output formatting ASCII codes (colors).
+declare -A col=(
+    [def]="$(tput sgr0)"
+    [red]="$(tput setaf 1)"
+    [green]="$(tput setaf 2)"
+    [yellow]="$(tput setaf 3)"
+)

@@ -1,0 +1,19 @@
+; The [client] section will be used by default.
+[client]
+host=
+user=
+password=
+; Example:
+; [client]
+; host=localhost
+; user=backup
+; password=backup_pass
+
+; The [client_dbn] section will be read in addition to [client].
+[client_dbn]
+user=dbn_user
+password=dbn_password
+; Example:
+; [client_dbn]
+; user=dbn_user
+; password=dbn_password
